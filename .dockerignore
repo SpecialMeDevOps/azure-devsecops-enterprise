@@ -1,0 +1,19 @@
+# Exclude everything from the build context by default.
+**
+
+# Include only the application source and runtime dependencies.
+!app/
+!app/**
+!requirements.txt
+
+# Exclude sensitive material even if it is placed under an allowed path.
+**/.env
+**/.env.*
+**/*.env
+**/secrets/
+**/secrets/**
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*credentials*

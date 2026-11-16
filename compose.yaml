@@ -1,0 +1,20 @@
+services:
+  secureops-api:
+    image: secureops-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    cpus: "1.0"
+    mem_limit: 256m
+    restart: unless-stopped
