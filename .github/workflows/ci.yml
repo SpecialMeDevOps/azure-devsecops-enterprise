@@ -72,29 +72,50 @@ jobs:
             cleanup_failed=0
 
             if docker container inspect "$container_name" >/dev/null 2>&1; then
-              state="$(docker inspect --format '{{.State.Status}}' "$container_name" 2>/dev/null || echo unknown)"
+              if state="$(docker inspect --format '{{.State.Status}}' "$container_name" 2>&1)"; then
+                :
+              else
+                echo "Failed to inspect container state: $state" >&2
+                state=unknown
+                cleanup_failed=1
+              fi
               if [[ "$state" == "running" ]]; then
                 if ! docker stop --time 30 "$container_name" >/dev/null; then
                   echo "Failed to stop container gracefully." >&2
                   cleanup_failed=1
                 fi
               fi
+            else
+              echo "Failed to inspect container before cleanup; continuing with best-effort diagnostics and removal." >&2
+              cleanup_failed=1
+            fi
 
-              docker logs "$container_name" > diagnostics/container.log 2>&1 || true
-              docker inspect "$container_name" > diagnostics/container-inspect.json 2>&1 || true
-              state="$(docker inspect --format '{{.State.Status}}' "$container_name" 2>/dev/null || echo unknown)"
-              exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$container_name" 2>/dev/null || echo unknown)"
-              echo "Container stopped with state=$state exit_code=$exit_code"
+            if ! docker logs "$container_name" > diagnostics/container.log 2>&1; then
+              echo "Failed to capture container logs; see diagnostics/container.log for details." >&2
+              cleanup_failed=1
+            fi
+            if ! docker inspect "$container_name" > diagnostics/container-inspect.json 2>&1; then
+              echo "Failed to capture container inspection; see diagnostics/container-inspect.json for details." >&2
+              cleanup_failed=1
+            fi
+            if inspection="$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$container_name" 2>&1)"; then
+              read -r state exit_code <<< "$inspection"
+            else
+              echo "Failed to inspect container state and exit code: $inspection" >&2
+              state=unknown
+              exit_code=unknown
+              cleanup_failed=1
+            fi
+            echo "Container stopped with state=$state exit_code=$exit_code"
 
-              if [[ "$state" != "exited" || "$exit_code" != "0" ]]; then
-                echo "Container did not stop with a successful exit." >&2
-                cleanup_failed=1
-              fi
+            if [[ "$state" != "exited" || "$exit_code" != "0" ]]; then
+              echo "Container did not stop with a successful exit." >&2
+              cleanup_failed=1
+            fi
 
-              if ! docker rm "$container_name" >/dev/null; then
-                echo "Failed to remove the test container." >&2
-                cleanup_failed=1
-              fi
+            if ! docker rm "$container_name" >/dev/null; then
+              echo "Failed to remove the test container." >&2
+              cleanup_failed=1
             fi
 
             if [[ "$result" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
