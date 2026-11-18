@@ -137,14 +137,9 @@ jobs:
                 state=unknown
                 cleanup_failed=1
               fi
-              if [[ "$state" == "running" ]]; then
-                if ! docker stop --time 30 "$container_name" >/dev/null; then
-                  echo "Failed to stop container gracefully." >&2
-                  cleanup_failed=1
-                fi
-              fi
             else
               echo "Failed to inspect container before cleanup; continuing with best-effort diagnostics and removal." >&2
+              state=unknown
               cleanup_failed=1
             fi
 
@@ -155,6 +150,12 @@ jobs:
             if ! docker inspect "$container_name" > diagnostics/container-inspect.json 2>&1; then
               echo "Failed to capture container inspection; see diagnostics/container-inspect.json for details." >&2
               cleanup_failed=1
+            fi
+            if [[ "$state" == "running" ]]; then
+              if ! docker stop --time 30 "$container_name" >/dev/null; then
+                echo "Failed to stop container gracefully." >&2
+                cleanup_failed=1
+              fi
             fi
             if inspection="$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$container_name" 2>&1)"; then
               read -r state exit_code <<< "$inspection"
@@ -201,12 +202,12 @@ jobs:
             container_state="$(docker inspect --format '{{.State.Status}}' "$container_name")"
             health_status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container_name")"
 
-            if [[ "$health_status" == "healthy" ]]; then
-              break
-            fi
             if [[ "$container_state" != "running" ]]; then
               echo "Container stopped before becoming healthy (state=$container_state)." >&2
               exit 1
+            fi
+            if [[ "$health_status" == "healthy" ]]; then
+              break
             fi
             sleep 2
           done
