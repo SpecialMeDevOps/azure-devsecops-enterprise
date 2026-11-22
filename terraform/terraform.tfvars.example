@@ -1,0 +1,42 @@
+subscription_id = "00000000-0000-0000-0000-000000000000"
+
+resource_group_name = "rg-secureops-dev"
+location            = "Central India"
+
+# Keep resource modes set to "reference" until a read-only Azure inventory
+# confirms that the named resources exist. Set a mode to "create" only after
+# confirming that the resource is absent. Importing is always a separate
+# explicit operation; see README.md.
+acr_mode                       = "reference"
+acr_name                       = "replace-with-existing-acr-name"
+acr_sku                        = "Basic"
+log_analytics_workspace_mode   = "reference"
+log_analytics_workspace_name   = "law-secureops-dev"
+container_apps_environment_mode = "reference"
+container_apps_environment_name = "cae-secureops-dev"
+managed_identity_mode          = "reference"
+managed_identity_name          = "id-secureops-api"
+container_app_mode             = "reference"
+container_app_name             = "ca-secureops-api"
+
+# Must identify an image that already exists in the configured ACR.
+# Prefer a digest-pinned image for production.
+container_image = "replace-with-existing-image-reference"
+
+# Leave false if an equivalent AcrPull assignment already exists.
+manage_acr_pull_role_assignment = false
+existing_acr_pull_assignment_confirmed = false
+
+# Public ingress is deliberately disabled by default.
+external_ingress_enabled = false
+
+min_replicas = 0
+max_replicas = 2
+
+log_retention_in_days = 30
+
+tags = {
+  application = "secureops-api"
+  environment = "development"
+  managed_by  = "terraform"
+}
