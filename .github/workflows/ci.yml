@@ -12,13 +12,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test-and-container:
-    name: Test and container verification
+  test-and-audit:
+    name: Application tests and Python security checks
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-    env:
-      IMAGE_TAG: secureops-api:ci-${{ github.sha }}
-      CONTAINER_NAME: secureops-api-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 20
 
     steps:
       - name: Check out source
@@ -33,7 +30,7 @@ jobs:
             requirements.txt
             requirements-dev.txt
 
-      - name: Prepare report and diagnostics directories
+      - name: Prepare report directories
         run: mkdir -p test-results diagnostics/security
 
       - name: Install application and test dependencies
@@ -73,24 +70,61 @@ jobs:
             --format json \
             --output diagnostics/security/pip-audit.json
 
-      - name: Scan filesystem with Trivy
-        id: trivy-fs
-        uses: aquasecurity/trivy-action@v0.36.0
-        continue-on-error: true
+      - name: Enforce Python security scan results
+        if: always()
+        env:
+          BANDIT_OUTCOME: ${{ steps.bandit.outcome }}
+          PIP_AUDIT_OUTCOME: ${{ steps.pip-audit.outcome }}
+        run: |
+          failed=0
+          for scanner in \
+            "Bandit:$BANDIT_OUTCOME" \
+            "pip-audit:$PIP_AUDIT_OUTCOME"; do
+            name="${scanner%%:*}"
+            outcome="${scanner#*:}"
+            if [[ "$outcome" != "success" ]]; then
+              echo "$name did not complete successfully (outcome=$outcome)." >&2
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Upload test reports and Python security diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          version: v0.76.2
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln
-          severity: HIGH,CRITICAL
-          format: json
-          output: diagnostics/security/trivy-fs.json
-          exit-code: "1"
+          name: ci-reports-and-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            test-results/
+            diagnostics/security/
+          if-no-files-found: warn
+          retention-days: 7
+
+  build-and-verify:
+    name: Approved Docker build and container verification
+    needs: test-and-audit
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment:
+      name: docker-build-approval
+    permissions:
+      contents: read
+    env:
+      IMAGE_TAG: secureops-api:ci-${{ github.sha }}
+      CONTAINER_NAME: secureops-api-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Prepare diagnostics directory
+        run: mkdir -p diagnostics/security
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build container image without pushing
+      - name: Build container image locally without pushing
         id: build
         uses: docker/build-push-action@v6
         timeout-minutes: 10
@@ -100,22 +134,19 @@ jobs:
           tags: ${{ env.IMAGE_TAG }}
           load: true
           push: false
-          metadata-file: diagnostics/build-metadata.json
 
-      - name: Scan local image with Trivy
-        id: trivy-image
-        uses: aquasecurity/trivy-action@v0.36.0
-        continue-on-error: true
-        with:
-          version: v0.76.2
-          scan-type: image
-          image-ref: ${{ env.IMAGE_TAG }}
-          scanners: vuln
-          vuln-type: os,library
-          severity: HIGH,CRITICAL
-          format: json
-          output: diagnostics/security/trivy-image.json
-          exit-code: "1"
+      - name: Save build metadata
+        env:
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+        run: |
+          if [[ -z "$BUILD_METADATA" ]]; then
+            echo "Docker build did not produce metadata." >&2
+            exit 1
+          fi
+          printf '%s\n' "$BUILD_METADATA" > diagnostics/build-metadata.json
+
+      - name: Record built image ID
+        run: docker image inspect --format '{{.Id}}' "$IMAGE_TAG" > image-id.txt
 
       - name: Run and verify container
         timeout-minutes: 5
@@ -243,18 +274,108 @@ jobs:
                   print(f"{path}: HTTP {response.status}, response verified")
           PY
 
-      - name: Enforce security scan results
+      - name: Export verified image for the scan job
+        run: |
+          mkdir -p image-artifact
+          cp image-id.txt image-artifact/image-id.txt
+          docker save --output image-artifact/image.tar "$IMAGE_TAG"
+
+      - name: Upload exact image for the scan job
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: image-artifact/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
+
+  trivy-scan:
+    name: Approved Trivy scans
+    needs: build-and-verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: trivy-scan-approval
+    permissions:
+      contents: read
+    env:
+      IMAGE_TAG: secureops-api:ci-${{ github.sha }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Prepare security diagnostics directory
+        run: mkdir -p diagnostics/security
+
+      - name: Download image artifact from this workflow run
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/image-artifact
+
+      - name: Load and verify the approved build image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker load --input "$RUNNER_TEMP/image-artifact/image.tar" \
+            | tee diagnostics/docker-load.txt
+          expected_image_id="$(cat "$RUNNER_TEMP/image-artifact/image-id.txt")"
+          actual_image_id="$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG")"
+          printf 'expected=%s\nactual=%s\n' "$expected_image_id" "$actual_image_id" \
+            > diagnostics/image-id-verification.txt
+          if [[ "$actual_image_id" != "$expected_image_id" ]]; then
+            echo "Downloaded image ID does not match the approved build." >&2
+            exit 1
+          fi
+          echo "Loaded image ID matches the approved build: $actual_image_id"
+
+      - name: Scan filesystem with Trivy
+        id: trivy-fs
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          version: v0.76.2
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: json
+          output: diagnostics/security/trivy-fs.json
+          exit-code: "1"
+
+      - name: Scan approved local image with Trivy
+        id: trivy-image
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          version: v0.76.2
+          scan-type: image
+          image-ref: ${{ env.IMAGE_TAG }}
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          format: json
+          output: diagnostics/security/trivy-image.json
+          exit-code: "1"
+
+      - name: Enforce Trivy scan results
         if: always()
         env:
-          BANDIT_OUTCOME: ${{ steps.bandit.outcome }}
-          PIP_AUDIT_OUTCOME: ${{ steps.pip-audit.outcome }}
           TRIVY_FS_OUTCOME: ${{ steps.trivy-fs.outcome }}
           TRIVY_IMAGE_OUTCOME: ${{ steps.trivy-image.outcome }}
         run: |
           failed=0
           for scanner in \
-            "Bandit:$BANDIT_OUTCOME" \
-            "pip-audit:$PIP_AUDIT_OUTCOME" \
             "Trivy filesystem:$TRIVY_FS_OUTCOME" \
             "Trivy image:$TRIVY_IMAGE_OUTCOME"; do
             name="${scanner%%:*}"
@@ -266,13 +387,11 @@ jobs:
           done
           exit "$failed"
 
-      - name: Upload test reports and diagnostics
+      - name: Upload Trivy JSON reports and scan diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ci-reports-and-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            test-results/
-            diagnostics/
+          name: ci-security-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: diagnostics/
           if-no-files-found: warn
           retention-days: 7
